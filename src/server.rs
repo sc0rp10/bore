@@ -25,6 +25,9 @@ pub struct Server {
     /// Concurrent map of IDs to incoming connections.
     conns: Arc<DashMap<Uuid, TcpStream>>,
 
+    /// Map of (port, remote_addr) to a handle that can be used to abort the listener task.
+    port_owners: Arc<DashMap<(u16, std::net::SocketAddr), tokio::task::JoinHandle<()>>>,
+
     /// IP address where the control server will bind to.
     bind_addr: IpAddr,
 
@@ -40,6 +43,7 @@ impl Server {
             port_range,
             conns: Arc::new(DashMap::new()),
             auth: secret.map(Authenticator::new),
+            port_owners: Arc::new(DashMap::new()),
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             bind_tunnels: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         }
@@ -116,6 +120,9 @@ impl Server {
     }
 
     async fn handle_connection(&self, stream: TcpStream) -> Result<()> {
+        let remote_addr = stream.peer_addr().ok();
+        let port_owners = Arc::clone(&self.port_owners);
+        let conns = Arc::clone(&self.conns);
         let mut stream = Delimited::new(stream);
         if let Some(auth) = &self.auth {
             if let Err(err) = auth.server_handshake(&mut stream).await {
@@ -131,6 +138,13 @@ impl Server {
                 Ok(())
             }
             Some(ClientMessage::Hello(port)) => {
+                // Before creating listener, check for an existing (port, remote_addr) owner
+                if let Some(addr) = remote_addr {
+                    if let Some((_, handle)) = port_owners.remove(&(port, addr)) {
+                        handle.abort(); // abort the old listener task
+                        info!(?port, ?addr, "aborted old listener for this port/addr");
+                    }
+                }
                 let listener = match self.create_listener(port).await {
                     Ok(listener) => listener,
                     Err(err) => {
@@ -143,30 +157,39 @@ impl Server {
                 info!(?host, ?port, "new client");
                 stream.send(ServerMessage::Hello(port)).await?;
 
-                loop {
-                    if stream.send(ServerMessage::Heartbeat).await.is_err() {
-                        // Assume that the TCP connection has been dropped.
-                        return Ok(());
-                    }
-                    const TIMEOUT: Duration = Duration::from_millis(500);
-                    if let Ok(result) = timeout(TIMEOUT, listener.accept()).await {
-                        let (stream2, addr) = result?;
-                        info!(?addr, ?port, "new connection");
-
-                        let id = Uuid::new_v4();
-                        let conns = Arc::clone(&self.conns);
-
-                        conns.insert(id, stream2);
-                        tokio::spawn(async move {
-                            // Remove stale entries to avoid memory leaks.
-                            sleep(Duration::from_secs(10)).await;
-                            if conns.remove(&id).is_some() {
-                                warn!(%id, "removed stale connection");
+                // Spawn and track the listener task for this port/addr
+                let handle = tokio::spawn({
+                    let mut stream = stream;
+                    let listener = listener;
+                    let port = port;
+                    let conns = Arc::clone(&conns);
+                    async move {
+                        loop {
+                            if stream.send(ServerMessage::Heartbeat).await.is_err() {
+                                break;
                             }
-                        });
-                        stream.send(ServerMessage::Connection(id)).await?;
+                            const TIMEOUT: Duration = Duration::from_millis(500);
+                            if let Ok(result) = timeout(TIMEOUT, listener.accept()).await {
+                                let (stream2, addr) = result.unwrap();
+                                info!(?addr, ?port, "new connection");
+                                let id = Uuid::new_v4();
+                                conns.insert(id, stream2);
+                                let conns2 = Arc::clone(&conns);
+                                tokio::spawn(async move {
+                                    sleep(Duration::from_secs(10)).await;
+                                    if conns2.remove(&id).is_some() {
+                                        warn!(%id, "removed stale connection");
+                                    }
+                                });
+                                let _ = stream.send(ServerMessage::Connection(id)).await;
+                            }
+                        }
                     }
+                });
+                if let Some(addr) = remote_addr {
+                    port_owners.insert((port, addr), handle);
                 }
+                Ok(())
             }
             Some(ClientMessage::Accept(id)) => {
                 info!(%id, "forwarding connection");
